@@ -19,3 +19,9 @@ uninstall:
 
 clean:
 	rm -rf zig-out .zig-cache
+
+dev-push:
+	@git config credential.helper 'cache --timeout=3600'
+	@git add .
+	@git commit -am "dev: update" || true
+	@git push

@@ -219,8 +219,10 @@ fn doGet(
         .response_writer = &body_writer.writer,
     });
 
-    const body_list = body_writer.toArrayList();
-    return .{ .status = result.status, .body = body_list.items };
+    var body_list = body_writer.toArrayList();
+    defer body_list.deinit(allocator);
+    const body = try allocator.dupe(u8, body_list.items);
+    return .{ .status = result.status, .body = body };
 }
 
 fn doPost(
@@ -258,8 +260,10 @@ fn doPost(
         .response_writer = &body_writer.writer,
     });
 
-    const body_list = body_writer.toArrayList();
-    return .{ .status = result.status, .body = body_list.items };
+    var body_list = body_writer.toArrayList();
+    defer body_list.deinit(allocator);
+    const body = try allocator.dupe(u8, body_list.items);
+    return .{ .status = result.status, .body = body };
 }
 
 fn printHttpResponse(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) void {

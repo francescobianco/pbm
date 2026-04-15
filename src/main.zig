@@ -16,6 +16,7 @@ const usage_text =
     \\  ping                Check if the server is reachable
     \\  status              Show server status
     \\  info [package]      Show service info or package details
+    \\  check <package>     Check health and metadata for a package
     \\  list                List available packages
     \\  fetch <git_url>     Mirror a Git repository on the server
     \\  update              Sync local state with the package source
@@ -36,6 +37,7 @@ const usage_text =
     \\  pbm list
     \\  pbm info
     \\  pbm info raylib-zig
+    \\  pbm check raylib-zig
     \\  pbm fetch https://github.com/ziglang/zig
     \\  pbm update
     \\  pbm search raylib
@@ -262,6 +264,13 @@ fn buildFetchBody(allocator: std.mem.Allocator, git_url: []const u8) ![]u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(.{ .url = git_url }, .{}, &out.writer);
+    return allocator.dupe(u8, out.writer.buffered());
+}
+
+fn buildCheckBody(allocator: std.mem.Allocator, package: []const u8) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(.{ .package = package }, .{}, &out.writer);
     return allocator.dupe(u8, out.writer.buffered());
 }
 
@@ -549,6 +558,7 @@ fn renderPackageInfo(allocator: std.mem.Allocator, body: []const u8) void {
     const fetchable = jsonBool(root, "pseudo_git_fetchable");
     const probe_commit = jsonNullableStr(root, "fetch_probe_commit");
     const probe_err = jsonNullableStr(root, "fetch_probe_error");
+    const language = jsonNullableStr(root, "language");
 
     // Status flags
     var flags_buf: [64]u8 = undefined;
@@ -611,6 +621,9 @@ fn renderPackageInfo(allocator: std.mem.Allocator, body: []const u8) void {
     }
     if (probe_err) |e| {
         printStdout(allocator, "error      {s}\n", .{e});
+    }
+    if (language) |lang| {
+        printStdout(allocator, "language   {s}\n", .{lang});
     }
 }
 
@@ -729,6 +742,27 @@ fn renderSearch(allocator: std.mem.Allocator, body: []const u8, query: []const u
         }
     }
     writeStdout("\n");
+}
+
+fn renderCheck(allocator: std.mem.Allocator, body: []const u8, package: []const u8) void {
+    _ = package;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        writeStdout(body);
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+
+    const name = jsonStr(root, "package");
+    const healthy = jsonBool(root, "healthy");
+    const language = jsonNullableStr(root, "language");
+
+    printStdout(allocator, "package    {s}\nstatus     {s}\n", .{ name, if (healthy) "healthy" else "unhealthy" });
+
+    if (language) |lang| {
+        printStdout(allocator, "language   {s}\n", .{lang});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -924,6 +958,31 @@ fn cmdUpdateCurl(allocator: std.mem.Allocator, cfg: Config) !void {
     printCurlCommand(allocator, "POST", url, "", null);
 }
 
+fn cmdCheck(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, package: []const u8) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/check");
+    defer allocator.free(url);
+
+    const body = try buildCheckBody(allocator, package);
+    defer allocator.free(body);
+
+    const res = httpRequest(allocator, client, .POST, url, body, null, null) catch |err|
+        fatal("request failed: {s}", .{@errorName(err)});
+    defer allocator.free(res.body);
+
+    checkStatus(allocator, res.status, res.body);
+    renderCheck(allocator, res.body, package);
+}
+
+fn cmdCheckCurl(allocator: std.mem.Allocator, cfg: Config, package: []const u8) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/check");
+    defer allocator.free(url);
+
+    const body = try buildCheckBody(allocator, package);
+    defer allocator.free(body);
+
+    printCurlCommand(allocator, "POST", url, body, null);
+}
+
 fn cmdClone(allocator: std.mem.Allocator, cfg: Config, package: []const u8) !void {
     const base = std.mem.trimRight(u8, cfg.base_url, "/");
     const clone_url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, package });
@@ -1007,6 +1066,9 @@ pub fn main() !void {
             try cmdFetchCurl(allocator, cfg, args[i]);
         } else if (std.mem.eql(u8, cmd, "update")) {
             try cmdUpdateCurl(allocator, cfg);
+        } else if (std.mem.eql(u8, cmd, "check")) {
+            if (i >= args.len) fatal("check requires a <package> argument", .{});
+            try cmdCheckCurl(allocator, cfg, args[i]);
         } else if (std.mem.eql(u8, cmd, "clone")) {
             fatal("--print-curl is not supported for 'clone' because it does not use HTTP", .{});
         } else {
@@ -1037,6 +1099,9 @@ pub fn main() !void {
         try cmdFetch(allocator, &client, cfg, args[i]);
     } else if (std.mem.eql(u8, cmd, "update")) {
         try cmdUpdate(allocator, &client, cfg);
+    } else if (std.mem.eql(u8, cmd, "check")) {
+        if (i >= args.len) fatal("check requires a <package> argument", .{});
+        try cmdCheck(allocator, &client, cfg, args[i]);
     } else if (std.mem.eql(u8, cmd, "clone")) {
         if (i >= args.len) fatal("clone requires a <package> argument", .{});
         try cmdClone(allocator, cfg, args[i]);

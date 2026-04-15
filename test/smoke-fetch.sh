@@ -2,17 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PBM_BIN="$ROOT_DIR/zig-out/bin/pbm"
 PORT="${PBM_SMOKE_PORT:-19122}"
 URL="https://github.com/francescobianco/mush-demo"
 SERVER_LOG="$(mktemp)"
 
 cleanup() {
-  if [[ -n "${SERVER_PID:-}" ]]; then
-    kill "$SERVER_PID" >/dev/null 2>&1 || true
-    wait "$SERVER_PID" >/dev/null 2>&1 || true
-  fi
-  rm -f "$SERVER_LOG"
+	if [[ -n "${SERVER_PID:-}" ]]; then
+		kill "$SERVER_PID" >/dev/null 2>&1 || true
+		wait "$SERVER_PID" >/dev/null 2>&1 || true
+	fi
+	rm -f "$SERVER_LOG"
 }
 trap cleanup EXIT
 
@@ -57,9 +56,12 @@ SERVER_PID=$!
 
 sleep 1
 
-OUTPUT="$(PACKBASE_URL="http://127.0.0.1:$PORT" "$PBM_BIN" fetch "$URL")"
+OUTPUT="$(PACKBASE_URL="http://127.0.0.1:$PORT" zig build run -- fetch "$URL")"
 
-EXPECTED="$(cat <<EOF
+EXPECTED="$(
+	cat <<EOF
+fetching...
+done
 fetch      mirror scheduled
 source     $URL
 package    mush-demo
@@ -70,10 +72,10 @@ EOF
 )"
 
 if [[ "$OUTPUT" != "$EXPECTED" ]]; then
-  printf 'unexpected smoke output\n' >&2
-  printf 'expected:\n%s\n' "$EXPECTED" >&2
-  printf 'actual:\n%s\n' "$OUTPUT" >&2
-  exit 1
+	printf 'unexpected smoke output\n' >&2
+	printf 'expected:\n%s\n' "$EXPECTED" >&2
+	printf 'actual:\n%s\n' "$OUTPUT" >&2
+	exit 1
 fi
 
 printf '%s\n' "$OUTPUT"

@@ -272,16 +272,16 @@ fn httpRequest(
     url: []const u8,
     payload: ?[]const u8,
     token: ?[]const u8,
+    progress_label: ?[]const u8,
 ) !struct { status: std.http.Status, body: []u8 } {
     const uri = std.Uri.parse(url) catch fatal("invalid URL: {s}", .{url});
 
-    var body_writer = std.io.Writer.Allocating.init(allocator);
-    errdefer body_writer.deinit();
-
     var auth_buf: [600]u8 = undefined;
-    var headers: [2]std.http.Header = undefined;
+    var headers: [3]std.http.Header = undefined;
     var headers_len: usize = 0;
 
+    headers[headers_len] = .{ .name = "Accept", .value = "application/json" };
+    headers_len += 1;
     if (payload != null and method == .POST) {
         headers[headers_len] = .{ .name = "Content-Type", .value = "application/json" };
         headers_len += 1;
@@ -292,18 +292,57 @@ fn httpRequest(
         headers_len += 1;
     }
 
-    const result = try client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = method,
-        .payload = payload,
-        .extra_headers = headers[0..headers_len],
-        .response_writer = &body_writer.writer,
-    });
+    if (progress_label) |label| {
+        writeStdout(label);
+        writeStdout("...\n");
+    }
 
-    var body_list = body_writer.toArrayList();
-    defer body_list.deinit(allocator);
-    const body = try allocator.dupe(u8, body_list.items);
-    return .{ .status = result.status, .body = body };
+    // Use the lower-level request API instead of client.fetch() to work around
+    // a bug in std.http.Client.fetch(): for HTTPS POST it calls body.end() which
+    // only flushes the TLS write buffer into the stream buffer, but never calls
+    // connection.flush() to send the encrypted data to the socket. The server
+    // never receives the body, so receiveHead() deadlocks. sendBodyComplete()
+    // correctly ends with r.connection.flush() which flushes both layers.
+    var req = client.request(method, uri, .{
+        .extra_headers = headers[0..headers_len],
+        .redirect_behavior = if (payload != null and method == .POST) .unhandled else @enumFromInt(3),
+    }) catch |err| {
+        if (progress_label != null) writeStderr("failed\n");
+        return err;
+    };
+    defer req.deinit();
+
+    if (payload) |p| {
+        req.sendBodyComplete(@constCast(p)) catch |err| {
+            if (progress_label != null) writeStderr("failed\n");
+            return err;
+        };
+    } else {
+        req.sendBodiless() catch |err| {
+            if (progress_label != null) writeStderr("failed\n");
+            return err;
+        };
+    }
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        if (progress_label != null) writeStderr("failed\n");
+        return err;
+    };
+
+    if (progress_label != null) writeStdout("done\n");
+
+    const status = response.head.status;
+    var body_list: std.ArrayList(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var transfer_buf: [64]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+    reader.appendRemainingUnlimited(allocator, &body_list) catch |err| switch (err) {
+        error.ReadFailed => return req.reader.body_err.?,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    return .{ .status = status, .body = try body_list.toOwnedSlice(allocator) };
 }
 
 fn checkStatus(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) void {
@@ -700,7 +739,7 @@ fn cmdPing(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) 
     const url = try buildUrl(allocator, cfg.base_url, "/api/status");
     defer allocator.free(url);
 
-    const res = httpRequest(allocator, client, .GET, url, null, null) catch |err| {
+    const res = httpRequest(allocator, client, .GET, url, null, null, null) catch |err| {
         printStderr(allocator, "ping failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -725,7 +764,7 @@ fn cmdStatus(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
     const url = try buildUrl(allocator, cfg.base_url, "/api/status");
     defer allocator.free(url);
 
-    const res = httpRequest(allocator, client, .GET, url, null, null) catch |err|
+    const res = httpRequest(allocator, client, .GET, url, null, null, null) catch |err|
         fatal("request failed: {s}", .{@errorName(err)});
     defer allocator.free(res.body);
 
@@ -749,7 +788,7 @@ fn cmdInfo(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, 
     const url = try buildUrl(allocator, cfg.base_url, path);
     defer allocator.free(url);
 
-    const res = httpRequest(allocator, client, .GET, url, null, null) catch |err|
+    const res = httpRequest(allocator, client, .GET, url, null, null, null) catch |err|
         fatal("request failed: {s}", .{@errorName(err)});
     defer allocator.free(res.body);
 
@@ -778,7 +817,7 @@ fn cmdList(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) 
     const url = try buildUrl(allocator, cfg.base_url, "/api/list");
     defer allocator.free(url);
 
-    const res = httpRequest(allocator, client, .GET, url, null, null) catch |err|
+    const res = httpRequest(allocator, client, .GET, url, null, null, null) catch |err|
         fatal("request failed: {s}", .{@errorName(err)});
     defer allocator.free(res.body);
 
@@ -817,7 +856,7 @@ fn cmdSearch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
     const url = try buildUrl(allocator, cfg.base_url, path);
     defer allocator.free(url);
 
-    const res = httpRequest(allocator, client, .GET, url, null, null) catch |err|
+    const res = httpRequest(allocator, client, .GET, url, null, null, null) catch |err|
         fatal("request failed: {s}", .{@errorName(err)});
     defer allocator.free(res.body);
 
@@ -847,7 +886,7 @@ fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config,
     const body = try buildFetchBody(allocator, git_url);
     defer allocator.free(body);
 
-    const res = httpRequest(allocator, client, .POST, url, body, cfg.token) catch |err|
+    const res = httpRequest(allocator, client, .POST, url, body, cfg.token, "fetching") catch |err|
         fatal("request failed: {s}", .{@errorName(err)});
     defer allocator.free(res.body);
 
@@ -871,7 +910,7 @@ fn cmdUpdate(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
 
     // POST /api/update has no request body; pass "" so the HTTP client
     // sends Content-Length: 0 instead of trying sendBodiless() on a POST.
-    const res = httpRequest(allocator, client, .POST, url, "", null) catch |err|
+    const res = httpRequest(allocator, client, .POST, url, "", null, "updating") catch |err|
         fatal("request failed: {s}", .{@errorName(err)});
     defer allocator.free(res.body);
 
@@ -978,6 +1017,7 @@ pub fn main() !void {
     }
 
     var client = std.http.Client{ .allocator = allocator };
+    client.next_https_rescan_certs = true;
     defer client.deinit();
 
     if (std.mem.eql(u8, cmd, "ping")) {

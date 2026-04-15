@@ -299,6 +299,32 @@ fn buildCheckBody(allocator: std.mem.Allocator, package: []const u8) ![]u8 {
     return allocator.dupe(u8, out.writer.buffered());
 }
 
+fn fetchJsonSimple(allocator: std.mem.Allocator, url: []const u8) !struct { status: std.http.Status, body: []u8 } {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{
+        .extra_headers = &.{.{ .name = "Accept", .value = "application/json" }},
+    });
+    defer req.deinit();
+
+    try req.sendBodiless();
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var transfer_buf: [64]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+    reader.appendRemainingUnlimited(allocator, &body) catch |err| switch (err) {
+        error.ReadFailed => return req.reader.body_err.?,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    return .{ .status = response.head.status, .body = try body.toOwnedSlice(allocator) };
+}
+
 fn httpRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -1014,7 +1040,7 @@ fn cmdUpdate(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
 
     const initial_state = parseUpdateState(allocator, res.body);
     if (initial_state == .running or initial_state == .queued) {
-        try pollUpdateState(allocator, client, cfg, timeout);
+        try pollUpdateState(allocator, cfg, timeout);
     } else {
         renderUpdate(allocator, res.body);
         writeStdout("\n");
@@ -1039,7 +1065,7 @@ fn parseUpdateState(allocator: std.mem.Allocator, body: []const u8) enum { idle,
     return .other;
 }
 
-fn pollUpdateState(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, timeout: u64) !void {
+fn pollUpdateState(allocator: std.mem.Allocator, cfg: Config, timeout: u64) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/update");
     defer allocator.free(url);
 
@@ -1052,7 +1078,7 @@ fn pollUpdateState(allocator: std.mem.Allocator, client: *std.http.Client, cfg: 
         elapsed += interval;
         dots = (dots + 1) % 4;
 
-        const res = httpRequest(allocator, client, .GET, url, "", null, null) catch |err| {
+        const res = fetchJsonSimple(allocator, url) catch |err| {
             printStdout(allocator, "\rupdating ... error: {s}\n", .{@errorName(err)});
             return;
         };

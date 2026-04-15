@@ -7,9 +7,10 @@ const usage_text =
     \\Usage: pbm [options] <command> [args...]
     \\
     \\Options:
-    \\  --host <host>   Server host (default: localhost)
-    \\  --port <port>   Server port (default: 9122)
-    \\  --help, -h      Show this help message
+    \\  --host <host>    Server host (default: localhost)
+    \\  --port <port>    Server port (default: 9122)
+    \\  --print-curl     Print the equivalent curl command instead of executing
+    \\  --help, -h       Show this help message
     \\
     \\Commands:
     \\  ping                Check if the server is reachable
@@ -18,6 +19,7 @@ const usage_text =
     \\  list                List available packages
     \\  fetch <git_url>     Mirror a Git repository on the server
     \\  update              Sync local state with the package source
+    \\  search <query>      Search packages by name
     \\  clone <package>     Git-clone a hosted package from the server
     \\
     \\Configuration (in order of precedence):
@@ -36,6 +38,7 @@ const usage_text =
     \\  pbm info raylib-zig
     \\  pbm fetch https://github.com/ziglang/zig
     \\  pbm update
+    \\  pbm search raylib
     \\  pbm clone raylib-zig
     \\
 ;
@@ -186,6 +189,82 @@ fn buildUrl(allocator: std.mem.Allocator, base: []const u8, path: []const u8) ![
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ std.mem.trimRight(u8, base, "/"), path });
 }
 
+fn appendShellQuoted(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try out.append(allocator, '\'');
+    for (value) |c| {
+        if (c == '\'') {
+            try out.appendSlice(allocator, "'\"'\"'");
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    try out.append(allocator, '\'');
+}
+
+fn appendCurlPart(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, prefix: []const u8, value: []const u8) !void {
+    if (out.items.len != 0) try out.append(allocator, ' ');
+    if (prefix.len != 0) {
+        try out.appendSlice(allocator, prefix);
+        try out.append(allocator, ' ');
+    }
+    try appendShellQuoted(out, allocator, value);
+}
+
+fn buildCurlCommand(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    url: []const u8,
+    payload: ?[]const u8,
+    token: ?[]const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "curl");
+
+    if (!std.mem.eql(u8, method, "GET")) {
+        try appendCurlPart(&out, allocator, "-X", method);
+    }
+
+    if (payload != null) {
+        try appendCurlPart(&out, allocator, "-H", "Content-Type: application/json");
+    }
+
+    if (token) |t| {
+        const header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{t});
+        defer allocator.free(header);
+        try appendCurlPart(&out, allocator, "-H", header);
+    }
+
+    if (payload) |body| {
+        try appendCurlPart(&out, allocator, "--data", body);
+    }
+
+    try appendCurlPart(&out, allocator, "", url);
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn printCurlCommand(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    url: []const u8,
+    payload: ?[]const u8,
+    token: ?[]const u8,
+) void {
+    const curl_cmd = buildCurlCommand(allocator, method, url, payload, token) catch
+        fatal("failed to build curl command", .{});
+    defer allocator.free(curl_cmd);
+    printStdout(allocator, "{s}\n", .{curl_cmd});
+}
+
+fn buildFetchBody(allocator: std.mem.Allocator, git_url: []const u8) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(.{ .url = git_url }, .{}, &out.writer);
+    return allocator.dupe(u8, out.writer.buffered());
+}
+
 fn httpRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -273,6 +352,45 @@ fn jsonNullableStr(v: std.json.Value, field: []const u8) ?[]const u8 {
     return null;
 }
 
+fn jsonObjectStr(obj: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    if (obj.get(field)) |f| return switch (f) {
+        .string => |s| s,
+        else => null,
+    };
+    return null;
+}
+
+fn jsonObjectInt(obj: std.json.ObjectMap, field: []const u8) ?i64 {
+    if (obj.get(field)) |f| return switch (f) {
+        .integer => |n| n,
+        .float => |n| @intFromFloat(n),
+        else => null,
+    };
+    return null;
+}
+
+fn jsonObjectArrayLen(obj: std.json.ObjectMap, field: []const u8) ?usize {
+    if (obj.get(field)) |f| return switch (f) {
+        .array => |items| items.items.len,
+        else => null,
+    };
+    return null;
+}
+
+fn firstNonNullStr(obj: std.json.ObjectMap, comptime fields: []const []const u8) ?[]const u8 {
+    inline for (fields) |field| {
+        if (jsonObjectStr(obj, field)) |value| return value;
+    }
+    return null;
+}
+
+fn firstNonNullInt(obj: std.json.ObjectMap, comptime fields: []const []const u8) ?i64 {
+    inline for (fields) |field| {
+        if (jsonObjectInt(obj, field)) |value| return value;
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Command renderers
 // ---------------------------------------------------------------------------
@@ -288,6 +406,11 @@ fn renderStatus(allocator: std.mem.Allocator, body: []const u8) void {
     const service = jsonStr(root, "service");
     const release = jsonStr(root, "release");
 
+    // Top-level health counters (new in r0013+)
+    const root_total = jsonInt(root, "packages_total");
+    const root_healthy = jsonInt(root, "packages_healthy");
+    const root_unhealthy = jsonInt(root, "packages_unhealthy");
+
     const upd = root.object.get("update") orelse {
         printStdout(allocator, "service  {s}  ({s})\n", .{ service, release });
         return;
@@ -302,8 +425,13 @@ fn renderStatus(allocator: std.mem.Allocator, body: []const u8) void {
     const repos_scanned = jsonInt(upd, "repos_scanned");
     const source_pkgs = jsonInt(upd, "source_packages");
 
+    printStdout(allocator, "service    {s}  ({s})\n", .{ service, release });
+
+    if (root_total > 0) {
+        printStdout(allocator, "healthy    {d}/{d}  ({d} unhealthy)\n", .{ root_healthy, root_total, root_unhealthy });
+    }
+
     printStdout(allocator,
-        \\service    {s}  ({s})
         \\
         \\update     {s}
         \\packages   {d} total  ·  {d} probed  ·  {d} synced
@@ -311,7 +439,7 @@ fn renderStatus(allocator: std.mem.Allocator, body: []const u8) void {
         \\tarballs   {d} present  ·  {d} created
         \\repos      {d} scanned
         \\
-    , .{ service, release, state, total, probed, synced, source_pkgs, tarballs_present, tarballs_created, repos_scanned });
+    , .{ state, total, probed, synced, source_pkgs, tarballs_present, tarballs_created, repos_scanned });
 }
 
 fn renderList(allocator: std.mem.Allocator, body: []const u8) void {
@@ -447,31 +575,58 @@ fn renderPackageInfo(allocator: std.mem.Allocator, body: []const u8) void {
     }
 }
 
-fn renderFetch(allocator: std.mem.Allocator, body: []const u8) void {
+fn renderFetchTo(writer: anytype, allocator: std.mem.Allocator, body: []const u8, git_url: []const u8) !void {
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     if (trimmed.len == 0) {
-        writeStdout("queued\n");
+        try writer.writeAll("fetch      queued\n");
+        try writer.print("source     {s}\n", .{git_url});
         return;
     }
-    // Try to parse JSON and show a friendly message
+
     if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
         defer parsed.deinit();
         const root = parsed.value;
-        if (root.object.get("status")) |s| {
-            if (s == .string) {
-                printStdout(allocator, "{s}\n", .{s.string});
-                return;
+
+        if (root == .object) {
+            const obj = root.object;
+            const package = firstNonNullStr(obj, &.{ "package", "name", "repo", "repository", "slug" });
+            const status = firstNonNullStr(obj, &.{ "status", "state", "result" });
+            const message = firstNonNullStr(obj, &.{ "message", "detail", "summary" });
+            const request_id = firstNonNullStr(obj, &.{ "request_id", "job_id", "task_id", "id" });
+            const tarballs = firstNonNullInt(obj, &.{ "tarballs", "tarball_count", "tags_count" }) orelse blk: {
+                if (jsonObjectArrayLen(obj, "tags")) |count| break :blk @as(i64, @intCast(count));
+                if (jsonObjectArrayLen(obj, "tarballs")) |count| break :blk @as(i64, @intCast(count));
+                break :blk null;
+            };
+
+            const headline = message orelse status orelse "queued";
+            try writer.print("fetch      {s}\n", .{headline});
+            try writer.print("source     {s}\n", .{git_url});
+
+            if (package) |value| try writer.print("package    {s}\n", .{value});
+            if (status) |value| {
+                if (!std.mem.eql(u8, value, headline)) try writer.print("status     {s}\n", .{value});
             }
-        }
-        if (root.object.get("message")) |m| {
-            if (m == .string) {
-                printStdout(allocator, "{s}\n", .{m.string});
-                return;
+            if (message) |value| {
+                if (!std.mem.eql(u8, value, headline)) try writer.print("message    {s}\n", .{value});
             }
+            if (request_id) |value| try writer.print("request    {s}\n", .{value});
+            if (tarballs) |value| try writer.print("tarballs   {d}\n", .{value});
+            return;
         }
     } else |_| {}
-    writeStdout(trimmed);
-    writeStdout("\n");
+
+    try writer.print("fetch      queued\nsource     {s}\nresponse   {s}\n", .{ git_url, trimmed });
+}
+
+fn renderFetch(allocator: std.mem.Allocator, body: []const u8, git_url: []const u8) void {
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    renderFetchTo(&stdout_writer.interface, allocator, body, git_url) catch {
+        writeStdout("fetch failed to render response\n");
+        return;
+    };
+    stdout_writer.interface.flush() catch {};
 }
 
 fn renderUpdate(allocator: std.mem.Allocator, body: []const u8) void {
@@ -502,6 +657,41 @@ fn renderUpdate(allocator: std.mem.Allocator, body: []const u8) void {
     writeStdout("\n");
 }
 
+fn renderSearch(allocator: std.mem.Allocator, body: []const u8, query: []const u8) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        writeStdout(body);
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+
+    // The response may be an array directly or an object with a "packages" field.
+    const items: std.json.Array = blk: {
+        if (root == .array) break :blk root.array;
+        if (root.object.get("packages")) |p| {
+            if (p == .array) break :blk p.array;
+        }
+        // Fallback: treat body as plain text
+        writeStdout(body);
+        return;
+    };
+
+    if (items.items.len == 0) {
+        printStdout(allocator, "no packages matching \"{s}\"\n", .{query});
+        return;
+    }
+
+    printStdout(allocator, "{d} package(s) matching \"{s}\"\n\n", .{ items.items.len, query });
+    for (items.items) |item| {
+        switch (item) {
+            .string => |s| printStdout(allocator, "  {s}\n", .{s}),
+            else => {},
+        }
+    }
+    writeStdout("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -525,6 +715,12 @@ fn cmdPing(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) 
     }
 }
 
+fn cmdPingCurl(allocator: std.mem.Allocator, cfg: Config) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/status");
+    defer allocator.free(url);
+    printCurlCommand(allocator, "GET", url, null, null);
+}
+
 fn cmdStatus(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/status");
     defer allocator.free(url);
@@ -535,6 +731,12 @@ fn cmdStatus(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
 
     checkStatus(allocator, res.status, res.body);
     renderStatus(allocator, res.body);
+}
+
+fn cmdStatusCurl(allocator: std.mem.Allocator, cfg: Config) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/status");
+    defer allocator.free(url);
+    printCurlCommand(allocator, "GET", url, null, null);
 }
 
 fn cmdInfo(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, package: ?[]const u8) !void {
@@ -560,6 +762,18 @@ fn cmdInfo(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, 
     }
 }
 
+fn cmdInfoCurl(allocator: std.mem.Allocator, cfg: Config, package: ?[]const u8) !void {
+    const path = if (package) |pkg|
+        try std.fmt.allocPrint(allocator, "/api/info/{s}", .{pkg})
+    else
+        try allocator.dupe(u8, "/api/status");
+    defer allocator.free(path);
+
+    const url = try buildUrl(allocator, cfg.base_url, path);
+    defer allocator.free(url);
+    printCurlCommand(allocator, "GET", url, null, null);
+}
+
 fn cmdList(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/list");
     defer allocator.free(url);
@@ -572,6 +786,57 @@ fn cmdList(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) 
     renderList(allocator, res.body);
 }
 
+fn cmdListCurl(allocator: std.mem.Allocator, cfg: Config) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/list");
+    defer allocator.free(url);
+    printCurlCommand(allocator, "GET", url, null, null);
+}
+
+fn urlEncodeQuery(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try out.append(allocator, c);
+        } else if (c == ' ') {
+            try out.append(allocator, '+');
+        } else {
+            try out.writer(allocator).print("%{X:0>2}", .{c});
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn cmdSearch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, query: []const u8) !void {
+    const encoded = try urlEncodeQuery(allocator, query);
+    defer allocator.free(encoded);
+
+    const path = try std.fmt.allocPrint(allocator, "/api/search?q={s}", .{encoded});
+    defer allocator.free(path);
+
+    const url = try buildUrl(allocator, cfg.base_url, path);
+    defer allocator.free(url);
+
+    const res = httpRequest(allocator, client, .GET, url, null, null) catch |err|
+        fatal("request failed: {s}", .{@errorName(err)});
+    defer allocator.free(res.body);
+
+    checkStatus(allocator, res.status, res.body);
+    renderSearch(allocator, res.body, query);
+}
+
+fn cmdSearchCurl(allocator: std.mem.Allocator, cfg: Config, query: []const u8) !void {
+    const encoded = try urlEncodeQuery(allocator, query);
+    defer allocator.free(encoded);
+
+    const path = try std.fmt.allocPrint(allocator, "/api/search?q={s}", .{encoded});
+    defer allocator.free(path);
+
+    const url = try buildUrl(allocator, cfg.base_url, path);
+    defer allocator.free(url);
+    printCurlCommand(allocator, "GET", url, null, null);
+}
+
 fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, git_url: []const u8) !void {
     if (cfg.token == null)
         writeStderr("warning: PACKBASE_TOKEN not set; request may be rejected by server\n");
@@ -579,7 +844,7 @@ fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config,
     const url = try buildUrl(allocator, cfg.base_url, "/api/fetch");
     defer allocator.free(url);
 
-    const body = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{git_url});
+    const body = try buildFetchBody(allocator, git_url);
     defer allocator.free(body);
 
     const res = httpRequest(allocator, client, .POST, url, body, cfg.token) catch |err|
@@ -587,7 +852,17 @@ fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config,
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderFetch(allocator, res.body);
+    renderFetch(allocator, res.body, git_url);
+}
+
+fn cmdFetchCurl(allocator: std.mem.Allocator, cfg: Config, git_url: []const u8) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/fetch");
+    defer allocator.free(url);
+
+    const body = try buildFetchBody(allocator, git_url);
+    defer allocator.free(body);
+
+    printCurlCommand(allocator, "POST", url, body, cfg.token);
 }
 
 fn cmdUpdate(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
@@ -602,6 +877,12 @@ fn cmdUpdate(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
 
     checkStatus(allocator, res.status, res.body);
     renderUpdate(allocator, res.body);
+}
+
+fn cmdUpdateCurl(allocator: std.mem.Allocator, cfg: Config) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/update");
+    defer allocator.free(url);
+    printCurlCommand(allocator, "POST", url, "", null);
 }
 
 fn cmdClone(allocator: std.mem.Allocator, cfg: Config, package: []const u8) !void {
@@ -637,6 +918,7 @@ pub fn main() !void {
 
     var cli_host: ?[]const u8 = null;
     var cli_port: ?u16 = null;
+    var print_curl = false;
     var i: usize = 1;
 
     while (i < args.len) : (i += 1) {
@@ -650,6 +932,8 @@ pub fn main() !void {
             if (i >= args.len) fatal("--port requires a value", .{});
             cli_port = std.fmt.parseInt(u16, args[i], 10) catch
                 fatal("invalid port: {s}", .{args[i]});
+        } else if (std.mem.eql(u8, arg, "--print-curl")) {
+            print_curl = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             writeStdout(usage_text);
             return;
@@ -666,6 +950,33 @@ pub fn main() !void {
     const cfg = try resolveConfig(allocator, cli_host, cli_port);
     defer freeConfig(allocator, cfg);
 
+    if (print_curl) {
+        if (std.mem.eql(u8, cmd, "ping")) {
+            try cmdPingCurl(allocator, cfg);
+        } else if (std.mem.eql(u8, cmd, "status")) {
+            try cmdStatusCurl(allocator, cfg);
+        } else if (std.mem.eql(u8, cmd, "info")) {
+            const pkg: ?[]const u8 = if (i < args.len) args[i] else null;
+            try cmdInfoCurl(allocator, cfg, pkg);
+        } else if (std.mem.eql(u8, cmd, "list")) {
+            try cmdListCurl(allocator, cfg);
+        } else if (std.mem.eql(u8, cmd, "search")) {
+            if (i >= args.len) fatal("search requires a <query> argument", .{});
+            try cmdSearchCurl(allocator, cfg, args[i]);
+        } else if (std.mem.eql(u8, cmd, "fetch")) {
+            if (i >= args.len) fatal("fetch requires a <git_url> argument", .{});
+            try cmdFetchCurl(allocator, cfg, args[i]);
+        } else if (std.mem.eql(u8, cmd, "update")) {
+            try cmdUpdateCurl(allocator, cfg);
+        } else if (std.mem.eql(u8, cmd, "clone")) {
+            fatal("--print-curl is not supported for 'clone' because it does not use HTTP", .{});
+        } else {
+            printStderr(allocator, "unknown command: {s}\n\n", .{cmd});
+            printUsageAndExit();
+        }
+        return;
+    }
+
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
@@ -678,6 +989,9 @@ pub fn main() !void {
         try cmdInfo(allocator, &client, cfg, pkg);
     } else if (std.mem.eql(u8, cmd, "list")) {
         try cmdList(allocator, &client, cfg);
+    } else if (std.mem.eql(u8, cmd, "search")) {
+        if (i >= args.len) fatal("search requires a <query> argument", .{});
+        try cmdSearch(allocator, &client, cfg, args[i]);
     } else if (std.mem.eql(u8, cmd, "fetch")) {
         if (i >= args.len) fatal("fetch requires a <git_url> argument", .{});
         try cmdFetch(allocator, &client, cfg, args[i]);
@@ -690,4 +1004,68 @@ pub fn main() !void {
         printStderr(allocator, "unknown command: {s}\n\n", .{cmd});
         printUsageAndExit();
     }
+}
+
+test "renderFetch formats structured response" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "status": "queued",
+        \\  "message": "mirror scheduled",
+        \\  "package": "mush-demo",
+        \\  "request_id": "req-123",
+        \\  "tarballs": 4
+        \\}
+    ;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try renderFetchTo(&out.writer, allocator, body, "https://github.com/francescobianco/mush-demo");
+
+    try std.testing.expectEqualStrings(
+        \\fetch      mirror scheduled
+        \\source     https://github.com/francescobianco/mush-demo
+        \\package    mush-demo
+        \\status     queued
+        \\request    req-123
+        \\tarballs   4
+        \\
+    , out.writer.buffered());
+}
+
+test "renderFetch falls back to raw response text" {
+    const allocator = std.testing.allocator;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try renderFetchTo(&out.writer, allocator, "queued", "https://github.com/francescobianco/mush-demo");
+
+    try std.testing.expectEqualStrings(
+        \\fetch      queued
+        \\source     https://github.com/francescobianco/mush-demo
+        \\response   queued
+        \\
+    , out.writer.buffered());
+}
+
+test "buildCurlCommand prints fetch curl with auth and json body" {
+    const allocator = std.testing.allocator;
+    const body = try buildFetchBody(allocator, "https://github.com/francescobianco/mush-demo");
+    defer allocator.free(body);
+
+    const curl_cmd = try buildCurlCommand(
+        allocator,
+        "POST",
+        "http://localhost:9122/api/fetch",
+        body,
+        "secret-token",
+    );
+    defer allocator.free(curl_cmd);
+
+    try std.testing.expectEqualStrings(
+        "curl -X 'POST' -H 'Content-Type: application/json' -H 'Authorization: Bearer secret-token' --data '{\"url\":\"https://github.com/francescobianco/mush-demo\"}' 'http://localhost:9122/api/fetch'",
+        curl_cmd,
+    );
 }

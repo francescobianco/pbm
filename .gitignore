@@ -1,4 +1,7 @@
 .idea/
 .vscode/
+.claude/
+.zig-cache/
+zig-out/
 .convcommit
 .pbmrc

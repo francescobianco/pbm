@@ -1053,8 +1053,8 @@ fn pollUpdateState(allocator: std.mem.Allocator, client: *std.http.Client, cfg: 
         dots = (dots + 1) % 4;
 
         const res = httpRequest(allocator, client, .GET, url, "", null, null) catch |err| {
-            writeStderr("\rfailed\n");
-            fatal("request failed: {s}", .{@errorName(err)});
+            printStdout(allocator, "\rupdating ... error: {s}\n", .{@errorName(err)});
+            return;
         };
         defer allocator.free(res.body);
 

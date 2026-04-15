@@ -1,7 +1,8 @@
 BIN     := pbm
 INSTALL := $(HOME)/.local/bin
+PREFIX  ?= /usr/local
 
-.PHONY: all build install uninstall clean
+.PHONY: all build install uninstall clean completion
 
 all: build
 
@@ -19,6 +20,13 @@ uninstall:
 
 clean:
 	rm -rf zig-out .zig-cache
+
+completion:
+	@echo "Installing bash completion to /etc/bash_completion.d/"
+	@sudo cp contrib/pbm-completion.bash /etc/bash_completion.d/pbm
+	@echo "Installing zsh completion to /usr/share/zsh/site-functions/"
+	@sudo cp contrib/pbm-completion.zsh /usr/share/zsh/site-functions/_pbm
+	@echo "Done. Restart your shell or run: source ~/.bashrc"
 
 dev-push:
 	@git config credential.helper 'cache --timeout=3600'

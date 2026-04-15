@@ -155,6 +155,7 @@ fn writeStderr(data: []const u8) void {
 }
 
 fn printStdout(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    writeStderr("printStdout called\n");
     const s = std.fmt.allocPrint(allocator, fmt, args) catch return;
     defer allocator.free(s);
     writeStdout(s);
@@ -1213,6 +1214,8 @@ pub fn main() !void {
         }
     }
 
+    writeStdout("after parsing\n");
+
     if (i >= args.len) printUsageAndExit();
 
     const cmd = args[i];
@@ -1222,15 +1225,18 @@ pub fn main() !void {
     defer freeConfig(allocator, cfg);
 
     if (print_curl) {
+        const curl_cfg = try resolveConfig(allocator, cli_host, cli_port);
+        defer freeConfig(allocator, curl_cfg);
+
         if (std.mem.eql(u8, cmd, "ping")) {
-            try cmdPingCurl(allocator, cfg);
+            try cmdPingCurl(allocator, curl_cfg);
         } else if (std.mem.eql(u8, cmd, "status")) {
-            try cmdStatusCurl(allocator, cfg);
+            try cmdStatusCurl(allocator, curl_cfg);
         } else if (std.mem.eql(u8, cmd, "info")) {
             const pkg: ?[]const u8 = if (i < args.len) args[i] else null;
-            try cmdInfoCurl(allocator, cfg, pkg);
+            try cmdInfoCurl(allocator, curl_cfg, pkg);
         } else if (std.mem.eql(u8, cmd, "list")) {
-            try cmdListCurl(allocator, cfg);
+            try cmdListCurl(allocator, curl_cfg);
         } else if (std.mem.eql(u8, cmd, "search")) {
             if (i >= args.len) fatal("search requires a <query> argument", .{});
             try cmdSearchCurl(allocator, cfg, args[i]);

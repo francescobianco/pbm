@@ -10,6 +10,8 @@ const usage_text =
     \\  --host <host>    Server host (default: localhost)
     \\  --port <port>    Server port (default: 9122)
     \\  --print-curl     Print the equivalent curl command instead of executing
+    \\  --print-json     Print raw JSON response from server (pretty-printed)
+    \\  --timeout <sec>  Timeout in seconds for update polling (default: 10)
     \\  --help, -h       Show this help message
     \\
     \\Commands:
@@ -183,6 +185,29 @@ fn fmtBytes(allocator: std.mem.Allocator, n: i64) []u8 {
     return std.fmt.allocPrint(allocator, "{d:.1} MB", .{@as(f64, @floatFromInt(n)) / (1024.0 * 1024.0)}) catch "";
 }
 
+fn printJson(allocator: std.mem.Allocator, body: []const u8) void {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) {
+        writeStdout("{}\n");
+        return;
+    }
+    if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
+        defer parsed.deinit();
+        var out: std.io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_tab }, &out.writer) catch {
+            writeStdout(trimmed);
+            writeStdout("\n");
+            return;
+        };
+        writeStdout(out.writer.buffered());
+        writeStdout("\n");
+    } else |_| {
+        writeStdout(trimmed);
+        writeStdout("\n");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -301,10 +326,7 @@ fn httpRequest(
         headers_len += 1;
     }
 
-    if (progress_label) |label| {
-        writeStdout(label);
-        writeStdout("...\n");
-    }
+    // progress_label handled by caller
 
     // Use the lower-level request API instead of client.fetch() to work around
     // a bug in std.http.Client.fetch(): for HTTPS POST it calls body.end() which
@@ -339,7 +361,7 @@ fn httpRequest(
         return err;
     };
 
-    if (progress_label != null) writeStdout("done\n");
+    if (progress_label != null) writeStdout("\r✓\n");
 
     const status = response.head.status;
     var body_list: std.ArrayList(u8) = .empty;
@@ -472,12 +494,15 @@ fn renderStatus(allocator: std.mem.Allocator, body: []const u8) void {
     const tarballs_created = jsonInt(upd, "tarballs_created");
     const repos_scanned = jsonInt(upd, "repos_scanned");
     const source_pkgs = jsonInt(upd, "source_packages");
+    const disk_free = jsonStr(upd, "disk_free");
 
     printStdout(allocator, "service    {s}  ({s})\n", .{ service, release });
 
     if (root_total > 0) {
         printStdout(allocator, "healthy    {d}/{d}  ({d} unhealthy)\n", .{ root_healthy, root_total, root_unhealthy });
     }
+
+    printStdout(allocator, "disk       {s}\n", .{disk_free});
 
     printStdout(allocator,
         \\
@@ -684,7 +709,7 @@ fn renderFetch(allocator: std.mem.Allocator, body: []const u8, git_url: []const 
 fn renderUpdate(allocator: std.mem.Allocator, body: []const u8) void {
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     if (trimmed.len == 0) {
-        writeStdout("update started\n");
+        writeStdout("\r✓  update started");
         return;
     }
     if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
@@ -693,20 +718,26 @@ fn renderUpdate(allocator: std.mem.Allocator, body: []const u8) void {
         for (&[_][]const u8{ "state", "status" }) |key| {
             if (root.object.get(key)) |s| {
                 if (s == .string) {
-                    printStdout(allocator, "{s}\n", .{s.string});
+                    const state = s.string;
+                    if (std.mem.eql(u8, state, "running")) {
+                        printStdout(allocator, "\r⟳ {s}·", .{state});
+                    } else if (std.mem.eql(u8, state, "queued")) {
+                        printStdout(allocator, "\r☑ {s}", .{state});
+                    } else {
+                        printStdout(allocator, "\r✓ {s}", .{state});
+                    }
                     return;
                 }
             }
         }
         if (root.object.get("message")) |m| {
             if (m == .string) {
-                printStdout(allocator, "{s}\n", .{m.string});
+                printStdout(allocator, "\r{s}", .{m.string});
                 return;
             }
         }
     } else |_| {}
     writeStdout(trimmed);
-    writeStdout("\n");
 }
 
 fn renderSearch(allocator: std.mem.Allocator, body: []const u8, query: []const u8) void {
@@ -769,7 +800,7 @@ fn renderCheck(allocator: std.mem.Allocator, body: []const u8, package: []const 
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmdPing(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
+fn cmdPing(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, print_json: bool) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/status");
     defer allocator.free(url);
 
@@ -781,7 +812,11 @@ fn cmdPing(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) 
 
     const code: u16 = @intFromEnum(res.status);
     if (code < 400) {
-        writeStdout("pong\n");
+        if (print_json) {
+            printJson(allocator, res.body);
+        } else {
+            writeStdout("pong\n");
+        }
     } else {
         printStdout(allocator, "server returned {d}\n", .{code});
         std.process.exit(1);
@@ -794,7 +829,7 @@ fn cmdPingCurl(allocator: std.mem.Allocator, cfg: Config) !void {
     printCurlCommand(allocator, "GET", url, null, null);
 }
 
-fn cmdStatus(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
+fn cmdStatus(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, print_json: bool) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/status");
     defer allocator.free(url);
 
@@ -803,7 +838,11 @@ fn cmdStatus(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderStatus(allocator, res.body);
+    if (print_json) {
+        printJson(allocator, res.body);
+    } else {
+        renderStatus(allocator, res.body);
+    }
 }
 
 fn cmdStatusCurl(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -812,9 +851,9 @@ fn cmdStatusCurl(allocator: std.mem.Allocator, cfg: Config) !void {
     printCurlCommand(allocator, "GET", url, null, null);
 }
 
-fn cmdInfo(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, package: ?[]const u8) !void {
-    const path = if (package) |pkg|
-        try std.fmt.allocPrint(allocator, "/api/info/{s}", .{pkg})
+fn cmdInfo(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, pkg: ?[]const u8, print_json: bool) !void {
+    const path = if (pkg) |p|
+        try std.fmt.allocPrint(allocator, "/api/info/{s}", .{p})
     else
         try allocator.dupe(u8, "/api/status");
     defer allocator.free(path);
@@ -828,10 +867,14 @@ fn cmdInfo(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, 
 
     checkStatus(allocator, res.status, res.body);
 
-    if (package != null) {
-        renderPackageInfo(allocator, res.body);
+    if (print_json) {
+        printJson(allocator, res.body);
     } else {
-        renderStatus(allocator, res.body);
+        if (pkg != null) {
+            renderPackageInfo(allocator, res.body);
+        } else {
+            renderStatus(allocator, res.body);
+        }
     }
 }
 
@@ -847,7 +890,7 @@ fn cmdInfoCurl(allocator: std.mem.Allocator, cfg: Config, package: ?[]const u8) 
     printCurlCommand(allocator, "GET", url, null, null);
 }
 
-fn cmdList(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
+fn cmdList(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, print_json: bool) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/list");
     defer allocator.free(url);
 
@@ -856,7 +899,11 @@ fn cmdList(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) 
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderList(allocator, res.body);
+    if (print_json) {
+        printJson(allocator, res.body);
+    } else {
+        renderList(allocator, res.body);
+    }
 }
 
 fn cmdListCurl(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -880,7 +927,7 @@ fn urlEncodeQuery(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn cmdSearch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, query: []const u8) !void {
+fn cmdSearch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, query: []const u8, print_json: bool) !void {
     const encoded = try urlEncodeQuery(allocator, query);
     defer allocator.free(encoded);
 
@@ -895,7 +942,11 @@ fn cmdSearch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderSearch(allocator, res.body, query);
+    if (print_json) {
+        printJson(allocator, res.body);
+    } else {
+        renderSearch(allocator, res.body, query);
+    }
 }
 
 fn cmdSearchCurl(allocator: std.mem.Allocator, cfg: Config, query: []const u8) !void {
@@ -910,7 +961,7 @@ fn cmdSearchCurl(allocator: std.mem.Allocator, cfg: Config, query: []const u8) !
     printCurlCommand(allocator, "GET", url, null, null);
 }
 
-fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, git_url: []const u8) !void {
+fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, git_url: []const u8, print_json: bool) !void {
     if (cfg.token == null)
         writeStderr("warning: PACKBASE_TOKEN not set; request may be rejected by server\n");
 
@@ -925,7 +976,11 @@ fn cmdFetch(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config,
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderFetch(allocator, res.body, git_url);
+    if (print_json) {
+        printJson(allocator, res.body);
+    } else {
+        renderFetch(allocator, res.body, git_url);
+    }
 }
 
 fn cmdFetchCurl(allocator: std.mem.Allocator, cfg: Config, git_url: []const u8) !void {
@@ -938,18 +993,94 @@ fn cmdFetchCurl(allocator: std.mem.Allocator, cfg: Config, git_url: []const u8) 
     printCurlCommand(allocator, "POST", url, body, cfg.token);
 }
 
-fn cmdUpdate(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config) !void {
+fn cmdUpdate(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, print_json: bool, timeout: u64) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/update");
     defer allocator.free(url);
 
-    // POST /api/update has no request body; pass "" so the HTTP client
-    // sends Content-Length: 0 instead of trying sendBodiless() on a POST.
-    const res = httpRequest(allocator, client, .POST, url, "", null, "updating") catch |err|
+    writeStdout("⟳ updating ... ");
+
+    const res = httpRequest(allocator, client, .POST, url, "", null, null) catch |err| {
+        writeStderr("\rfailed\n");
         fatal("request failed: {s}", .{@errorName(err)});
+    };
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderUpdate(allocator, res.body);
+
+    if (print_json) {
+        printJson(allocator, res.body);
+        return;
+    }
+
+    const initial_state = parseUpdateState(allocator, res.body);
+    if (initial_state == .running or initial_state == .queued) {
+        try pollUpdateState(allocator, client, cfg, timeout);
+    } else {
+        renderUpdate(allocator, res.body);
+        writeStdout("\n");
+    }
+}
+
+fn parseUpdateState(allocator: std.mem.Allocator, body: []const u8) enum { idle, running, queued, other } {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return .idle;
+    if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
+        defer parsed.deinit();
+        const root = parsed.value;
+        for (&[_][]const u8{ "state", "status" }) |key| {
+            if (root.object.get(key)) |s| {
+                if (s == .string) {
+                    if (std.mem.eql(u8, s.string, "running")) return .running;
+                    if (std.mem.eql(u8, s.string, "queued")) return .queued;
+                }
+            }
+        }
+    } else |_| {}
+    return .other;
+}
+
+fn pollUpdateState(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, timeout: u64) !void {
+    const url = try buildUrl(allocator, cfg.base_url, "/api/update");
+    defer allocator.free(url);
+
+    const interval: u64 = 2;
+    var elapsed: u64 = 0;
+    var dots: u3 = 0;
+
+    while (elapsed < timeout) {
+        std.Thread.sleep(interval * std.time.ns_per_s);
+        elapsed += interval;
+        dots = (dots + 1) % 4;
+
+        const res = httpRequest(allocator, client, .GET, url, "", null, null) catch |err| {
+            writeStderr("\rfailed\n");
+            fatal("request failed: {s}", .{@errorName(err)});
+        };
+        defer allocator.free(res.body);
+
+        const state = parseUpdateState(allocator, res.body);
+        if (state != .running) {
+            if (state == .idle) {
+                writeStdout("\rupdating ... idle\n");
+            } else {
+                writeStdout("\rupdating ... ");
+                renderUpdate(allocator, res.body);
+            }
+            return;
+        }
+
+        const spinner = switch (dots) {
+            0 => "·   ",
+            1 => " ·  ",
+            2 => "  · ",
+            3 => "   ·",
+            else => "·   ",
+        };
+        writeStdout("\rupdating ... running");
+        writeStdout(spinner);
+    }
+
+    printStdout(allocator, "\rupdating ... timeout ({d}s)\n", .{timeout});
 }
 
 fn cmdUpdateCurl(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -958,7 +1089,7 @@ fn cmdUpdateCurl(allocator: std.mem.Allocator, cfg: Config) !void {
     printCurlCommand(allocator, "POST", url, "", null);
 }
 
-fn cmdCheck(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, package: []const u8) !void {
+fn cmdCheck(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, package: []const u8, print_json: bool) !void {
     const url = try buildUrl(allocator, cfg.base_url, "/api/check");
     defer allocator.free(url);
 
@@ -970,7 +1101,11 @@ fn cmdCheck(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config,
     defer allocator.free(res.body);
 
     checkStatus(allocator, res.status, res.body);
-    renderCheck(allocator, res.body, package);
+    if (print_json) {
+        printJson(allocator, res.body);
+    } else {
+        renderCheck(allocator, res.body, package);
+    }
 }
 
 fn cmdCheckCurl(allocator: std.mem.Allocator, cfg: Config, package: []const u8) !void {
@@ -1017,24 +1152,36 @@ pub fn main() !void {
     var cli_host: ?[]const u8 = null;
     var cli_port: ?u16 = null;
     var print_curl = false;
+    var print_json = false;
+    var update_timeout: u64 = 10;
     var i: usize = 1;
 
-    while (i < args.len) : (i += 1) {
+    while (i < args.len) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--host")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            writeStdout(usage_text);
+            return;
+        } else if (std.mem.eql(u8, arg, "--host")) {
             i += 1;
             if (i >= args.len) fatal("--host requires a value", .{});
             cli_host = args[i];
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) fatal("--port requires a value", .{});
             cli_port = std.fmt.parseInt(u16, args[i], 10) catch
                 fatal("invalid port: {s}", .{args[i]});
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--print-curl")) {
             print_curl = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            writeStdout(usage_text);
-            return;
+        } else if (std.mem.eql(u8, arg, "--print-json")) {
+            print_json = true;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            i += 1;
+            if (i >= args.len) fatal("--timeout requires a value", .{});
+            update_timeout = std.fmt.parseInt(u64, args[i], 10) catch
+                fatal("invalid timeout: {s}", .{args[i]});
+            i += 1;
         } else {
             break;
         }
@@ -1083,25 +1230,25 @@ pub fn main() !void {
     defer client.deinit();
 
     if (std.mem.eql(u8, cmd, "ping")) {
-        try cmdPing(allocator, &client, cfg);
+        try cmdPing(allocator, &client, cfg, print_json);
     } else if (std.mem.eql(u8, cmd, "status")) {
-        try cmdStatus(allocator, &client, cfg);
+        try cmdStatus(allocator, &client, cfg, print_json);
     } else if (std.mem.eql(u8, cmd, "info")) {
         const pkg: ?[]const u8 = if (i < args.len) args[i] else null;
-        try cmdInfo(allocator, &client, cfg, pkg);
+        try cmdInfo(allocator, &client, cfg, pkg, print_json);
     } else if (std.mem.eql(u8, cmd, "list")) {
-        try cmdList(allocator, &client, cfg);
+        try cmdList(allocator, &client, cfg, print_json);
     } else if (std.mem.eql(u8, cmd, "search")) {
         if (i >= args.len) fatal("search requires a <query> argument", .{});
-        try cmdSearch(allocator, &client, cfg, args[i]);
+        try cmdSearch(allocator, &client, cfg, args[i], print_json);
     } else if (std.mem.eql(u8, cmd, "fetch")) {
         if (i >= args.len) fatal("fetch requires a <git_url> argument", .{});
-        try cmdFetch(allocator, &client, cfg, args[i]);
+        try cmdFetch(allocator, &client, cfg, args[i], print_json);
     } else if (std.mem.eql(u8, cmd, "update")) {
-        try cmdUpdate(allocator, &client, cfg);
+        try cmdUpdate(allocator, &client, cfg, print_json, update_timeout);
     } else if (std.mem.eql(u8, cmd, "check")) {
         if (i >= args.len) fatal("check requires a <package> argument", .{});
-        try cmdCheck(allocator, &client, cfg, args[i]);
+        try cmdCheck(allocator, &client, cfg, args[i], print_json);
     } else if (std.mem.eql(u8, cmd, "clone")) {
         if (i >= args.len) fatal("clone requires a <package> argument", .{});
         try cmdClone(allocator, cfg, args[i]);

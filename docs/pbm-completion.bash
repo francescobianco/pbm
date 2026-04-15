@@ -13,7 +13,7 @@ _pbm() {
 	_init_completion || return
 
 	# Opzioni globali (si applicano a tutti i comandi)
-	local global_opts="--host --port --print-curl --help -h"
+	local global_opts="--host --port --print-curl --print-json --help -h"
 
 	# Comandi disponibili
 	local commands="ping status info list fetch update search clone"

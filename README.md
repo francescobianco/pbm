@@ -1,31 +1,31 @@
 # pbm - Packbase Manager
 
-CLI client per gestire il server [packbase](https://github.com/yafb/packbase).
+CLI client for managing the [packbase](https://github.com/yafb/packbase) server.
 
-## Installazione
+## Installation
 
 ```bash
 make build
 make install
 ```
 
-Oppure scarica il binary dalla [ releases page](https://github.com/yafb/pbm/releases).
+Or download the binary from the [releases page](https://github.com/yafb/pbm/releases).
 
 ## Quick Start
 
-1. Avvia il server packbase con Docker:
+1. Start the packbase server with Docker:
 
 ```bash
 docker run -p 9122:9122 -d yafb/packbase
 ```
 
-2. Verifica lo stato del server:
+2. Check the server status:
 
 ```bash
 pbm status
 ```
 
-Output esempio:
+Example output:
 
 ```
 service    packbase  (r0016)
@@ -39,65 +39,65 @@ tarballs   0 present  ·  91 created
 repos      1 scanned
 ```
 
-## Comandi
+## Commands
 
-| Comando | Descrizione |
+| Command | Description |
 |---------|-------------|
-| `pbm ping` | Verifica se il server è raggiungibile |
-| `pbm status` | Mostra lo stato del server |
-| `pbm info [package]` | Mostra info sul server o dettagli di un pacchetto |
-| `pbm list` | Elenca tutti i pacchetti disponibili |
-| `pbm search <query>` | Cerca pacchetti per nome |
-| `pbm fetch <git_url>` | Aggiunge un nuovo pacchetto dal repository git |
-| `pbm update` | Sincronizza lo stato locale con le sorgenti pacchetti |
-| `pbm check <package>` | Verifica salute e metadati di un pacchetto |
-| `pbm clone <package>` | Git-clone un pacchetto hosted |
+| `pbm ping` | Check if the server is reachable |
+| `pbm status` | Show server status |
+| `pbm info [package]` | Show server info or package details |
+| `pbm list` | List all available packages |
+| `pbm search <query>` | Search packages by name |
+| `pbm fetch <git_url>` | Add a new package from git repository |
+| `pbm update` | Sync local state with package sources |
+| `pbm check <package>` | Check health and metadata of a package |
+| `pbm clone <package>` | Git-clone a hosted package |
 
-## Opzioni Globali
+## Global Options
 
-| Opzione | Descrizione | Default |
-|---------|-------------|---------|
+| Option | Description | Default |
+|--------|-------------|---------|
 | `--host <host>` | Server host | localhost |
 | `--port <port>` | Server port | 9122 |
-| `--print-json` | Stampa JSON raw dal server | - |
-| `--print-curl` | Stampa il comando curl equivalente | - |
-| `--timeout <sec>` | Timeout polling per update (default: 10) | 10 |
+| `--print-json` | Print raw JSON from server | - |
+| `--print-curl` | Print equivalent curl command | - |
+| `--timeout <sec>` | Polling timeout for update (default: 10) | 10 |
 
-## Configurazione
+## Configuration
 
-Le opzioni sono lette in ordine di precedenza:
-1. Flag `--host` / `--port`
-2. Variabile `PACKBASE_URL` (es. `http://myserver:9122`)
-3. File `.pbmrc` nella directory corrente
-4. File `.pbmrc` nella home directory
+Options are read in order of precedence:
+1. Flags `--host` / `--port`
+2. Environment variable `PACKBASE_URL` (e.g. `http://myserver:9122`)
+3. File `.pbmrc` in current directory
+4. File `.pbmrc` in home directory
 
-Per l'autenticazione con `fetch`, usa la variabile `PACKBASE_TOKEN`.
+For authentication with `fetch`, use the `PACKBASE_TOKEN` environment variable.
 
-## Esempi
+## Examples
 
 ```bash
-# Verifica connessione
+# Check connection
 pbm ping
 
-# Cerca pacchetti
+# Search packages
 pbm search zlib
 
-# Aggiungi un pacchetto (richiede TOKEN)
+# Add a package (requires TOKEN)
 PACKBASE_TOKEN=xxx pbm fetch https://github.com/example/package
 
-# Aggiorna i dati (con polling)
+# Update data (with polling)
 pbm update --timeout 30
 
-# Modalità curl per debug
+# Curl mode for debugging
 pbm --print-curl status
 ```
 
-## Completamento Shell
+## Shell Completion
 
 Bash:
 ```bash
 make completion
-# oppure manualmente
+# or manually
 sudo cp contrib/pbm-completion.bash /etc/bash_completion.d/pbm
 ```
 
